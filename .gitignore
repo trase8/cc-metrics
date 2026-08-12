@@ -11,6 +11,9 @@ __pycache__/
 .idea/
 .vscode/
 
+# Playwright MCP — снапшоты и логи консоли от проверок в браузере
+.playwright-mcp/
+
 # Секреты и локальные настройки
 .env
 .env.*

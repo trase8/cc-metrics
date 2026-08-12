@@ -6,3 +6,4 @@ CLAUDE.md
 .git/
 tests/
 .pytest_cache/
+.playwright-mcp/

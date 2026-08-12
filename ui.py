@@ -237,7 +237,16 @@ def render_ui_page(
     tooltipEl.replaceChildren(header, rows);
     const rect = context.chart.canvas.getBoundingClientRect();
     tooltipEl.style.opacity = 1;
-    tooltipEl.style.left = (rect.left + window.scrollX + tooltip.caretX + 12) + 'px';
+
+    // У правого края (последний день на графике) тултип справа от курсора не влезает
+    // в экран — переносим его влево. offsetWidth читаем после replaceChildren, чтобы
+    // мерить актуальную ширину, а не ширину предыдущей наведённой точки.
+    let left = rect.left + window.scrollX + tooltip.caretX + 12;
+    const overflowsRight = left + tooltipEl.offsetWidth > window.scrollX + document.documentElement.clientWidth - 8;
+    if (overflowsRight) {{
+      left = rect.left + window.scrollX + tooltip.caretX - tooltipEl.offsetWidth - 12;
+    }}
+    tooltipEl.style.left = left + 'px';
     tooltipEl.style.top = (rect.top + window.scrollY + tooltip.caretY) + 'px';
   }}
 
