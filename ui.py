@@ -59,7 +59,7 @@ def embed_json(obj: Any) -> str:
 
 
 async def load_chart_data(conn, conditions: list[str], params: list[Any], since_day: datetime, until_day: datetime):
-    """Возвращает (данные для Chart.js, полная детализация по дням для табличного вида)."""
+    """Возвращает данные для Chart.js: ось X — дни, датасет на каждый из топ-N скиллов + "Другое"."""
     ranking = await conn.fetch(GLOBAL_RANKING_SQL)
     featured = [r["skill"] for r in ranking[:FEATURED_SLOTS]]
     slot_of = {name: f"--series-{i + 1}" for i, name in enumerate(featured)}
@@ -75,11 +75,8 @@ async def load_chart_data(conn, conditions: list[str], params: list[Any], since_
     day_index = {d.date().isoformat(): i for i, d in enumerate(days)}
 
     series: dict[str, list[int]] = {}
-    table_rows: list[tuple[str, str, int]] = []
     for r in rows:
-        day_str = r["bucket"].date().isoformat()
-        table_rows.append((day_str, r["skill"], r["n"]))
-        idx = day_index.get(day_str)
+        idx = day_index.get(r["bucket"].date().isoformat())
         if idx is None:
             continue  # вне диапазона дней — не должно происходить при согласованных условиях, но не рушим страницу
         label = r["skill"] if r["skill"] in slot_of else OTHER_LABEL
@@ -94,12 +91,7 @@ async def load_chart_data(conn, conditions: list[str], params: list[Any], since_
         for label in ordered_labels
     ]
 
-    # день desc, скилл asc — устойчивая сортировка Python делает это в два прохода
-    table_rows.sort(key=lambda t: t[1])
-    table_rows.sort(key=lambda t: t[0], reverse=True)
-
-    chart = {"labels": [d.date().isoformat() for d in days], "datasets": datasets}
-    return chart, table_rows
+    return {"labels": [d.date().isoformat() for d in days], "datasets": datasets}
 
 
 UI_PAGE_TEMPLATE = """<!doctype html>
@@ -143,11 +135,6 @@ UI_PAGE_TEMPLATE = """<!doctype html>
   .error {{ color: #b00020; }}
   .chart-card {{ background: var(--surface-1); border: 1px solid var(--gridline); border-radius: 8px; padding: 1rem; }}
   .chart-note {{ color: var(--text-muted); font-size: 0.78rem; margin-top: 0.6rem; }}
-  details.table-toggle {{ margin-top: 1rem; }}
-  summary {{ cursor: pointer; color: var(--text-secondary); font-size: 0.85rem; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 0.85rem; margin-top: 0.5rem; }}
-  th, td {{ border-bottom: 1px solid var(--gridline); padding: 0.35rem 0.6rem; text-align: left; }}
-  th {{ color: var(--text-secondary); }}
   .cc-tooltip {{
     position: absolute; pointer-events: none; opacity: 0; transition: opacity .1s;
     background: var(--surface-1); border: 1px solid var(--gridline); border-radius: 6px;
@@ -176,13 +163,12 @@ def render_ui_page(
     *,
     error: str = "",
     chart: dict[str, Any] | None = None,
-    table_rows: list[tuple[str, str, int]] | None = None,
     clamped: bool = False,
     filters: dict[str, str],
 ) -> str:
     if error:
         body = f'<p class="error">{escape(error)}</p>'
-    elif not table_rows:
+    elif not chart or not chart["datasets"]:
         body = '<p class="muted">Ничего не найдено.</p>'
     else:
         note_parts = []
@@ -190,15 +176,9 @@ def render_ui_page(
             note_parts.append(f"диапазон ограничен {MAX_CHART_DAYS} днями")
         if any(ds["label"] == OTHER_LABEL for ds in chart["datasets"]):
             note_parts.append(
-                f'«{OTHER_LABEL}» объединяет скиллы за пределами топ-{FEATURED_SLOTS} по общему числу '
-                "вызовов — полный список ниже, в табличном виде"
+                f'«{OTHER_LABEL}» объединяет скиллы за пределами топ-{FEATURED_SLOTS} по общему числу вызовов'
             )
         note = f'<p class="chart-note">{escape("; ".join(note_parts))}.</p>' if note_parts else ""
-
-        table_head = "<tr><th>День</th><th>Скилл</th><th>Вызовов</th></tr>"
-        table_body = "".join(
-            f"<tr><td>{day}</td><td>{escape(skill)}</td><td>{n}</td></tr>" for day, skill, n in table_rows
-        )
 
         body = f"""
 <div class="chart-card">
@@ -208,10 +188,6 @@ def render_ui_page(
 </div>
 {note}
 <div id="cc-tooltip" class="cc-tooltip"></div>
-<details class="table-toggle">
-  <summary>Табличный вид ({len(table_rows)} строк, без folding «{OTHER_LABEL}»)</summary>
-  <table>{table_head}{table_body}</table>
-</details>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.min.js"
         integrity="sha384-XcdcwHqIPULERb2yDEM4R0XaQKU3YnDsrTmjACBZyfdVVqjh6xQ4/DCMd7XLcA6Y"
         crossorigin="anonymous"></script>
@@ -397,10 +373,10 @@ async def ui(
 
     try:
         async with config.pool.acquire() as conn:
-            chart, table_rows = await load_chart_data(conn, conditions, params, since_dt, until_dt)
+            chart = await load_chart_data(conn, conditions, params, since_dt, until_dt)
     except Exception:
         log.exception("не смог прочитать skill_usage для /ui")
         return HTMLResponse(render_ui_page(error="Не смог прочитать данные из базы.", filters=filters),
                              status_code=503)
 
-    return HTMLResponse(render_ui_page(chart=chart, table_rows=table_rows, clamped=clamped, filters=filters))
+    return HTMLResponse(render_ui_page(chart=chart, clamped=clamped, filters=filters))
