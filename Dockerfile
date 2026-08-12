@@ -27,4 +27,6 @@ USER app
 
 EXPOSE 4318
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "4318"]
+# Порт берётся из PORT, если он задан: Coolify и подобные платформы обычно ждут
+# приложение на своём порту, а не на 4318.
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-4318}"]
