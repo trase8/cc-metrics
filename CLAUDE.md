@@ -63,7 +63,7 @@ FastAPI-приложение, принимает OTLP/JSON на `POST /v1/logs`,
 
 ```bash
 uv run main.py           # http://127.0.0.1:4318, страница просмотра — /ui
-uv run pytest            # tests/ — пока один тест, GET /health
+uv run pytest            # tests/ — юниты api.py/ui.py + один сквозной тест GET /health
 uv add <package>         # зависимости; правит pyproject.toml + uv.lock
 uv add --dev <package>   # то же самое, но для dev-группы (pytest, httpx)
 uv sync                  # привести .venv в соответствие с pyproject.toml
