@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 CLAUDE.md
 .git/
+tests/
+.pytest_cache/

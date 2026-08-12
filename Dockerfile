@@ -20,7 +20,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-COPY main.py ./
+COPY main.py config.py api.py ui.py ./
 
 RUN useradd --create-home --uid 10001 app && chown -R app:app /app
 USER app
