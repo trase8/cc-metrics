@@ -18,11 +18,12 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+# Без asctime: в строке уже печатается время самого события, а время приёма
+# добавит рантайм (docker logs -t, journald и т.п.).
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-5s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(levelname)-5s %(message)s",
 )
 log = logging.getLogger("cc-metrics")
 
@@ -130,7 +131,16 @@ async def receive_logs(request: Request) -> JSONResponse:
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
-        log.error("не разобрал тело запроса: %s", exc)
+        content_type = request.headers.get("content-type", "")
+        if "protobuf" in content_type:
+            # Самая вероятная ошибка настройки: клиент шлёт protobuf, а мы понимаем только JSON.
+            log.error(
+                "клиент прислал protobuf (%s) — приёмник понимает только JSON. "
+                "Поставь OTEL_EXPORTER_OTLP_PROTOCOL=http/json",
+                content_type,
+            )
+        else:
+            log.error("не разобрал тело запроса (content-type=%r): %s", content_type, exc)
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
     # Ошибка разбора одной записи не должна ронять весь батч: экспортёр начнёт его

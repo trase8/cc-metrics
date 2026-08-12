@@ -62,6 +62,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 это наш случай), плюс `user.account_uuid`, `organization.id`, `session.id`, `terminal.type`. Отдельно
 прокидывать личность не нужно.
 
+## Обкатка на одном пользователе
+
+До раскатки на всю организацию конфиг ставится не в админку, а в личный
+`~/.claude/settings.json`, в блок `env` — так поток идёт только с одной машины:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_METRICS_EXPORTER": "none",
+    "OTEL_TRACES_EXPORTER": "none",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://<домен>",
+    "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer <токен>",
+    "OTEL_LOG_TOOL_DETAILS": "1",
+    "OTEL_RESOURCE_ATTRIBUTES": "department=rnd,team.id=ai-sdlc"
+  }
+}
+```
+
+Грабли, на которые тут легко наступить:
+
+- `CLAUDE_CODE_ENABLE_TELEMETRY` должен быть `"1"`. Значение `"0"` выключает вообще всё, и остальные
+  переменные становятся бессмысленны.
+- `OTEL_LOGS_EXPORTER` обязателен: события — это сигнал logs, без него не уедет ничего, сколько бы
+  ни был настроен endpoint.
+- Протокол именно `http/json`. Приёмник разбирает только JSON; при `http/protobuf` он ответит 400
+  и напишет в лог, что именно не так.
+- В **общем** `OTEL_EXPORTER_OTLP_ENDPOINT` указывается база без `/v1/logs` — путь экспортёр добавляет сам.
+  А вот в per-signal варианте `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` путь пишется целиком.
+- OTel-конфигурация не применяется на лету: нужен полный перезапуск Claude Code.
+
+Когда обкатка пройдена, тот же блок `env` переезжает в **Admin Settings → Claude Code → Managed settings**
+и раскатывается на всех (см. разделы выше).
+
 ## Два пути вызова скилла — оба ловятся одним событием
 
 Скилл запускается либо человеком (`/имя-скилла`), либо самой моделью, которая распознала интент и решила,
@@ -126,6 +162,46 @@ admin-механизмом и тоже требуют approval-диалога.
 несёт `command_name` и `command_source`, но имена кастомных и плагинных команд там схлопываются в `custom`
 без того же `OTEL_LOG_TOOL_DETAILS=1`.
 
+## Приёмник
+
+`main.py` — FastAPI-приложение, принимает OTLP/JSON на `POST /v1/logs` и печатает поток в stdout.
+Хранилища пока нет намеренно: сначала убеждаемся, что данные доходят, потом подставляем запись в БД
+вместо `handle_record`.
+
+```
+INFO  SKILL  2026-08-12 15:54:53  vasya@01.tech  skill=01-dev-pipeline:cr  trigger=user-slash  source=plugin
+INFO  event  2026-08-12 15:58:13  vasya@01.tech  api_request
+```
+
+Что уже учтено и проверено на синтетических payload'ах: gzip-тела (`Content-Encoding: gzip`), `intValue`
+строкой (в OTLP/JSON int64 всегда строка), вложенные `arrayValue` / `kvlistValue`, ответ в форме
+`{"partialSuccess": {}}`, который ждёт экспортёр. Ошибка обработки одной записи не роняет батч — иначе
+экспортёр начнёт слать его повторно. `/v1/metrics` и `/v1/traces` отвечают 200 и игнорируются: сейчас они
+выключены на клиентах, но 404 в этом месте только путал бы.
+
+Если в логах пошли строки `skill=custom_skill` — на клиентах не доехал `OTEL_LOG_TOOL_DETAILS=1`,
+приёмник специально помечает это в строке.
+
+| Переменная | Смысл |
+| --- | --- |
+| `CC_METRICS_TOKEN` | ожидаемый Bearer-токен; пусто — проверка выключена |
+| `CC_METRICS_LOG_ALL_EVENTS` | `0` — печатать только `skill_activated` |
+| `PORT` | порт при локальном запуске (в контейнере порт задаёт `CMD`) |
+| `TZ` | пояс для времени событий; без неё в контейнере UTC |
+
+Локально и в контейнере:
+
+```bash
+uv run main.py                                    # http://127.0.0.1:4318
+
+docker build -t cc-metrics .
+docker run -d --name cc-metrics -p 4318:4318 \
+  -e TZ=Europe/Moscow -e CC_METRICS_TOKEN=<токен> cc-metrics
+```
+
+Порт 4318 — стандартный для OTLP поверх HTTP. В `OTEL_EXPORTER_OTLP_ENDPOINT` указывается **база без**
+`/v1/logs`: путь экспортёр добавляет сам. Наружу нужен HTTPS-терминатор перед контейнером.
+
 ## Окружение и команды
 
 Окружение управляется **uv** (`.venv` создан uv 0.12.3, CPython 3.14). Не используй `pip install` напрямую
@@ -142,7 +218,20 @@ uv sync                  # привести .venv в соответствие с
 Тестового раннера, линтера и форматтера в проекте нет. Прежде чем запускать `pytest`, `ruff` или `mypy`,
 их нужно добавить (`uv add --dev ...`) и зафиксировать конфигурацию в `pyproject.toml`.
 
+## Деплой
+
+Coolify, сборка из `Dockerfile` в репозитории (`git@github.com:trase8/cc-metrics.git`, ветка `main`).
+Сборка идёт на Linux-хосте; базовые образы мультиархитектурные, отдельной настройки под amd64 не требуется.
+`uv.lock` обязан быть в репозитории — `Dockerfile` ставит зависимости с `--frozen`.
+
+Ориентиры для Coolify: порт контейнера **4318**, healthcheck — `GET /health`, HTTPS терминирует Traefik
+самого Coolify, `CC_METRICS_TOKEN` задаётся в UI как переменная окружения.
+
+`TZ` намеренно не задаётся: контейнер пишет время событий в UTC, и это устраивает. Если когда-нибудь
+понадобится местное время — `tzdata` в образе уже есть, достаточно передать `TZ`.
+
 ## Git
 
-Каталог не является git-репозиторием (`git init` не выполнялся) и `.gitignore` отсутствует. Если инициализируешь
-репозиторий, `.venv/` и `.idea/` в него попадать не должны.
+Репозиторий: `git@github.com:trase8/cc-metrics.git`, основная ветка `main`. `.venv/`, `.idea/` и `.env*`
+закрыты `.gitignore`. Секретов в файлах нет и быть не должно — токен приходит только через переменную
+окружения.
