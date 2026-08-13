@@ -2,19 +2,50 @@
 
 import asyncio
 import gzip
+import json
+import logging
 import re
 
+import api
 import config
 
 from api import (
+    MAX_TEXT_LEN,
+    clean_text,
     decode_any_value,
     decode_attributes,
+    describe_broken_record,
     describe_skill,
     drop_identity,
     gunzip_capped,
     handle_record,
     read_body_capped,
 )
+
+
+class _FakeBatchRequest:
+    """Запрос с готовым телом — чтобы дёргать receive_logs() без сети."""
+
+    def __init__(self, body: bytes, headers=None):
+        self._body = body
+        self.headers = headers or {}
+        self.client = None
+
+    async def stream(self):
+        yield self._body
+
+
+def _post(body: bytes):
+    return asyncio.run(api.receive_logs(_FakeBatchRequest(body)))
+
+
+def _batch(*records) -> bytes:
+    return json.dumps({"resourceLogs": [{"scopeLogs": [{"logRecords": list(records)}]}]}).encode()
+
+
+def _skill_record(**attrs) -> dict:
+    attrs = {"event.name": "skill_activated", **attrs}
+    return {"attributes": [{"key": k, "value": {"stringValue": v}} for k, v in attrs.items()]}
 
 
 # --- decode_any_value -------------------------------------------------------
@@ -51,6 +82,13 @@ def test_decode_any_value_unknown_shape_returns_none():
     assert decode_any_value({}) is None
 
 
+def test_decode_any_value_non_dict_returns_none():
+    # `"stringValue" in 5` — это TypeError, а прийти по проводу может что угодно.
+    assert decode_any_value(5) is None
+    assert decode_any_value("строка") is None
+    assert decode_any_value(None) is None
+
+
 # --- decode_attributes -------------------------------------------------------
 
 def test_decode_attributes_builds_flat_dict():
@@ -68,6 +106,15 @@ def test_decode_attributes_skips_non_string_keys():
 
 def test_decode_attributes_handles_none_input():
     assert decode_attributes(None) == {}
+
+
+def test_decode_attributes_tolerates_object_instead_of_list():
+    # Так выглядели атрибуты, на которых разбор падал: объект вместо массива.
+    assert decode_attributes({"user.email": "vasya@01.tech"}) == {}
+
+
+def test_decode_attributes_skips_non_dict_items():
+    assert decode_attributes(["мусор", {"key": "ok", "value": {"stringValue": "y"}}]) == {"ok": "y"}
 
 
 # --- describe_skill -----------------------------------------------------------
@@ -92,10 +139,40 @@ def test_handle_record_ignores_non_skill_events():
     assert handle_record(record, {}) is None
 
 
+def test_handle_record_maps_every_attribute_to_its_own_column():
+    # Главная защита от молчаливой порчи: у каждого атрибута свой уникальный маркер, поэтому
+    # перепутанные местами колонки видно сразу. Восемь из девяти колонок — nullable text,
+    # так что в базе такая перестановка не вызвала бы никакой ошибки.
+    record = {
+        "attributes": [
+            {"key": "event.name", "value": {"stringValue": "skill_activated"}},
+            {"key": "skill.name", "value": {"stringValue": "маркер-skill"}},
+            {"key": "invocation_trigger", "value": {"stringValue": "маркер-trigger"}},
+            {"key": "skill.source", "value": {"stringValue": "маркер-source"}},
+            {"key": "plugin.name", "value": {"stringValue": "маркер-plugin"}},
+            {"key": "marketplace.name", "value": {"stringValue": "маркер-marketplace"}},
+            {"key": "skill.kind", "value": {"stringValue": "маркер-kind"}},
+            {"key": "session.id", "value": {"stringValue": "маркер-session"}},
+            {"key": "event.sequence", "value": {"intValue": "42"}},
+            {"key": "terminal.type", "value": {"stringValue": "маркер-terminal"}},
+        ],
+    }
+    assert handle_record(record, {}) == config.SkillUsageRow(
+        skill="маркер-skill",
+        trigger="маркер-trigger",
+        source="маркер-source",
+        plugin="маркер-plugin",
+        marketplace="маркер-marketplace",
+        skill_kind="маркер-kind",
+        session_id="маркер-session",
+        event_sequence=42,
+        terminal_type="маркер-terminal",
+    )
+
+
 def test_handle_record_missing_skill_name_falls_back_to_placeholder():
     record = {"attributes": [{"key": "event.name", "value": {"stringValue": "skill_activated"}}]}
-    row = handle_record(record, {})
-    assert row[0] == "?"
+    assert handle_record(record, {}).skill == "?"
 
 
 def test_handle_record_record_attrs_win_over_resource_attrs_on_conflict():
@@ -108,8 +185,8 @@ def test_handle_record_record_attrs_win_over_resource_attrs_on_conflict():
         ],
     }
     row = handle_record(record, resource_attrs)
-    assert row[8] == "record-terminal"  # запись переопределяет ресурс при совпадении ключа
-    assert row[6] == "sess-1"  # ключ, которого не было в записи, приходит из resource_attrs
+    assert row.terminal_type == "record-terminal"  # запись переопределяет ресурс при совпадении ключа
+    assert row.session_id == "sess-1"  # ключ, которого не было в записи, приходит из resource_attrs
 
 
 def test_handle_record_ignores_non_int_sequence():
@@ -121,8 +198,7 @@ def test_handle_record_ignores_non_int_sequence():
             {"key": "event.sequence", "value": {"stringValue": "not-an-int"}},
         ],
     }
-    row = handle_record(record, {})
-    assert row[7] is None
+    assert handle_record(record, {}).event_sequence is None
 
 
 def test_handle_record_keeps_identity_out_of_the_row():
@@ -139,15 +215,14 @@ def test_handle_record_keeps_identity_out_of_the_row():
     row = handle_record(record, resource_attrs)
     assert "vasya@01.tech" not in str(row)
     assert "uuid-from-resource" not in str(row)
-    assert row[0] == "01-dev-pipeline:cr"  # неперсональные поля на месте
+    assert row.skill == "01-dev-pipeline:cr"  # неперсональные поля на месте
 
 
-def test_handle_record_row_length_matches_insert_sql():
-    # Строка из api.py подставляется в INSERT_SQL из config.py — при правке колонок
-    # эти два места разъезжаются молча, до первой записи в реальную базу.
+def test_handle_record_returns_named_row_not_bare_tuple():
+    # Именно тип связывает api.py с INSERT_SQL: голый кортеж снова сделал бы порядок
+    # колонок неявным договором между двумя файлами.
     record = {"attributes": [{"key": "event.name", "value": {"stringValue": "skill_activated"}}]}
-    placeholders = re.search(r"VALUES \(([^)]+)\)", config.INSERT_SQL, re.S).group(1)
-    assert len(handle_record(record, {})) == len(placeholders.split(","))
+    assert isinstance(handle_record(record, {}), config.SkillUsageRow)
 
 
 # --- drop_identity ---------------------------------------------------------------
@@ -171,6 +246,94 @@ def test_drop_identity_removes_unknown_user_attributes_too():
 def test_drop_identity_keeps_attributes_with_similar_names():
     attrs = {"userland": "x", "terminal.type": "iTerm.app", "organization.id": "org"}
     assert drop_identity(attrs) == attrs
+
+
+# --- clean_text ------------------------------------------------------------------
+
+def test_clean_text_removes_control_characters():
+    # Перевод строки внутри skill.name давал в логе строку, неотличимую от настоящей записи.
+    assert clean_text("cr\n2026-08-13 00:00:00 INFO  SKILL  skill=ПОДДЕЛКА") == (
+        "cr 2026-08-13 00:00:00 INFO  SKILL  skill=ПОДДЕЛКА"
+    )
+
+
+def test_clean_text_caps_length():
+    assert len(clean_text("A" * 100_000)) == MAX_TEXT_LEN
+
+
+def test_clean_text_keeps_none_as_none():
+    # В базе это отсутствующий атрибут, а не строка "None".
+    assert clean_text(None) is None
+
+
+def test_describe_skill_cleans_control_characters():
+    assert "\n" not in describe_skill({"skill.name": "cr\nПОДДЕЛКА"})
+
+
+def test_handle_record_cleans_text_before_writing_the_row():
+    row = handle_record(_skill_record(**{"skill.name": "cr\nПОДДЕЛКА" + "A" * 100_000}), {})
+    assert "\n" not in row.skill
+    assert len(row.skill) == MAX_TEXT_LEN
+
+
+# --- describe_broken_record ------------------------------------------------------
+
+def test_describe_broken_record_prints_shape_without_values():
+    # Значений не печатаем вообще: в сырой записи лежит личность, а drop_identity()
+    # к моменту ошибки ещё не отработал.
+    result = describe_broken_record({"attributes": {"user.email": "vasya@01.tech"}, "timeUnixNano": "1"})
+    assert "vasya@01.tech" not in result
+    assert '"attributes": "dict"' in result  # форма записи для отладки осталась
+
+
+def test_describe_broken_record_handles_non_dict():
+    assert describe_broken_record("строка") == "<str>"
+
+
+# --- receive_logs: личность и кривые тела ----------------------------------------
+
+def test_broken_record_does_not_leak_identity_into_the_log(monkeypatch, caplog):
+    # Ветка обработки ошибки печатала сырую запись — то есть до drop_identity(). Любое
+    # падение handle_record() на записи с user.email клало адрес в лог, а логи живут долго.
+    def boom(record, resource_attrs):
+        raise ValueError("что угодно")
+
+    monkeypatch.setattr(api, "handle_record", boom)
+    body = _batch({"attributes": [{"key": "user.email", "value": {"stringValue": "vasya@01.tech"}}]})
+
+    with caplog.at_level(logging.ERROR, logger="cc-metrics"):
+        response = _post(body)
+
+    assert response.status_code == 200  # одна битая запись не роняет батч
+    assert "vasya@01.tech" not in caplog.text
+    assert "attributes" in caplog.text
+
+
+def test_receive_logs_rejects_body_that_is_not_an_object():
+    # Дальше везде .get(), а на списке или строке это AttributeError мимо try, то есть 500.
+    for body in (b"[]", '"строка"'.encode(), b"5"):
+        assert _post(body).status_code == 400
+
+
+def test_receive_logs_rejects_deeply_nested_json():
+    # На такой вложенности json.loads бросает RecursionError, а не JSONDecodeError:
+    # без отдельной ветки в except это был бы 500. Тело — объект намеренно, иначе
+    # сработала бы проверка "тело не объект" и ветка RecursionError осталась бы непройденной.
+    body = b'{"resourceLogs":' + b"[" * 100_000 + b"]" * 100_000 + b"}"
+    assert _post(body).status_code == 400
+
+
+def test_receive_logs_survives_garbage_inside_the_batch():
+    body = json.dumps({
+        "resourceLogs": [
+            "мусор",
+            {
+                "resource": "не объект",
+                "scopeLogs": ["мусор", {"logRecords": ["мусор", _skill_record(**{"skill.name": "cr"})]}],
+            },
+        ],
+    }).encode()
+    assert _post(body).status_code == 200
 
 
 # --- gunzip_capped -------------------------------------------------------------

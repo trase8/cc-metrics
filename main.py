@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 import api
 import config
@@ -22,8 +23,19 @@ app.include_router(ui.router)
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> JSONResponse:
+    """Состояние приёмника вместе с состоянием базы прямо сейчас, а не на момент старта.
+
+    503 при недоступной базе — намеренно: в этом состоянии приёмник и так отвечает 503 на
+    /v1/logs, и снаружи он должен выглядеть сломанным, а не здоровым. Событий это не теряет,
+    экспортёр повторит батч. Режим "только лог" (DATABASE_URL не задан) остаётся здоровым:
+    это рабочая конфигурация, а не поломка.
+    """
+    if config.pool is None:
+        return JSONResponse({"status": "ok", "database": "off"})
+    if not await config.check_database():
+        return JSONResponse({"status": "error", "database": "unavailable"}, status_code=503)
+    return JSONResponse({"status": "ok", "database": "ok"})
 
 
 if __name__ == "__main__":

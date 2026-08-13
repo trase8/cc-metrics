@@ -15,14 +15,25 @@ from config import log
 
 router = APIRouter()
 
-# Палитра — references/palette.md из скилла dataviz. 7 слотов для самых используемых
-# скиллов (по общему числу вызовов за всё время, а не по текущему фильтру — иначе при
-# смене фильтра выжившие линии перекрашивались бы, см. anti-patterns.md "Recolor-on-filter").
-# Всё, что не попало в топ-7, идёт в "Другое" отдельным нейтральным цветом.
-FEATURED_SLOTS = 7
+# Сколько скиллов показываем отдельными линиями (по общему числу вызовов за всё время, а не
+# по текущему фильтру — иначе при смене фильтра выжившие линии перекрашивались бы, см.
+# anti-patterns.md "Recolor-on-filter" из скилла dataviz). Всё, что не попало, идёт в "Другое".
+FEATURED_SLOTS = 50
+
+# Выверенных цветов в палитре (references/palette.md из dataviz) всего столько — они лежат в CSS
+# как --series-1..N и умеют переключаться со светлой темы на тёмную. Слотам сверх этого числа
+# цвет генерируется: различить полсотни линий на глаз всё равно нельзя, поэтому дальше цвет
+# нужен лишь чтобы линии не сливались в одну и находились по тултипу.
+PALETTE_SLOTS = 7
 DEFAULT_WINDOW_DAYS = 30
 MAX_CHART_DAYS = 400
 OTHER_LABEL = "Другое"
+
+# Границы, дальше которых дата из параметра запроса не пускается. Нужны не ради смысла,
+# а ради арифметики: у 0001-01-01 минус окно по умолчанию нет представимого результата —
+# datetime бросает OverflowError, и получается 500 на ровном месте.
+MIN_DAY = datetime(2000, 1, 1, tzinfo=timezone.utc)
+MAX_DAY = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
 GLOBAL_RANKING_SQL = (
     "SELECT skill FROM skill_usage GROUP BY skill "
@@ -50,19 +61,39 @@ def parse_day_param(value: str, *, end_of_day: bool) -> datetime | None:
         return None
     if end_of_day:
         day = day.replace(hour=23, minute=59, second=59, microsecond=999999)
-    return day.replace(tzinfo=timezone.utc)
+    # Прижимаем к MIN_DAY/MAX_DAY уже после tzinfo — сравнивать наивную дату с осведомлённой нельзя,
+    # а fromisoformat возвращает осведомлённую, если в строке было смещение.
+    return min(max(day.replace(tzinfo=timezone.utc), MIN_DAY), MAX_DAY)
 
 
 def embed_json(obj: Any) -> str:
-    """JSON для вставки в <script>: экранирует "</", иначе строка вида skill.name="</script>"
-    из данных (пришли по сети, не наши) обрывает тег раньше времени."""
-    return json.dumps(obj, ensure_ascii=False, default=str).replace("</", "<\\/")
+    """JSON для вставки в <script>: экранирует "<".
+
+    Данные пришли по сети, а не от нас. Имя скилла вида "</script>" обрывает тег раньше времени,
+    а "<!--<script>" переводит разбор страницы в состояние, где настоящий </script> её уже не
+    закрывает. Экранирование одного символа закрывает оба случая: внутри JSON-строки \\u003c
+    законен, а вне строк "<" в JSON не встречается.
+    """
+    return json.dumps(obj, ensure_ascii=False, default=str).replace("<", "\\u003c")
+
+
+def slot_color(rank: int) -> dict[str, str]:
+    """Цвет линии по месту скилла в глобальном рейтинге (0 — самый частый).
+
+    До PALETTE_SLOTS отдаём имя CSS-переменной: такой цвет меняется вместе с темой страницы.
+    Дальше — готовый hsl(): шаг по кругу берём золотым углом, так соседние по рейтингу линии
+    заведомо не оказываются похожего оттенка. Светлота одна для обеих тем — компромисс,
+    зато без второй палитры на 43 цвета.
+    """
+    if rank < PALETTE_SLOTS:
+        return {"color_var": f"--series-{rank + 1}"}
+    return {"color": f"hsl({(rank - PALETTE_SLOTS) * 137.508 % 360:.0f} 62% 52%)"}
 
 
 async def load_chart_data(conn, skill: str, since_day: datetime, until_day: datetime):
     """Возвращает данные для Chart.js: ось X — дни, датасет на каждый из топ-N скиллов + "Другое"."""
     featured = [r["skill"] for r in await conn.fetch(GLOBAL_RANKING_SQL)]
-    slot_of = {name: f"--series-{i + 1}" for i, name in enumerate(featured)}
+    slot_of = {name: slot_color(i) for i, name in enumerate(featured)}
 
     # Границы окна — всегда, фильтр по скиллу — по желанию; отсюда и нумерация плейсхолдеров.
     where = "received_at BETWEEN $1 AND $2"
@@ -92,7 +123,7 @@ async def load_chart_data(conn, skill: str, since_day: datetime, until_day: date
         ordered_labels.append(OTHER_LABEL)
 
     datasets = [
-        {"label": label, "color_var": slot_of.get(label, "--series-other"), "data": series[label]}
+        {"label": label, "data": series[label], **slot_of.get(label, {"color_var": "--series-other"})}
         for label in ordered_labels
     ]
 
@@ -284,7 +315,9 @@ def render_ui_page(
       data: {{
         labels: dayLabels,
         datasets: DATA.datasets.map(function (ds) {{
-          const color = cssVar(ds.color_var);
+          // Слоты из палитры приходят как имя CSS-переменной (меняется вместе с темой),
+          // сгенерированные сверх палитры — готовым hsl().
+          const color = ds.color || cssVar(ds.color_var);
           return {{
             label: ds.label, data: ds.data,
             borderColor: color, backgroundColor: color, borderWidth: 2,

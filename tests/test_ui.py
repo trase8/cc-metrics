@@ -4,7 +4,19 @@ import asyncio
 import json
 from datetime import date, datetime, timezone
 
-from ui import FEATURED_SLOTS, OTHER_LABEL, day_range, embed_json, load_chart_data, parse_day_param
+from ui import (
+    FEATURED_SLOTS,
+    MAX_DAY,
+    MIN_DAY,
+    OTHER_LABEL,
+    PALETTE_SLOTS,
+    day_range,
+    embed_json,
+    load_chart_data,
+    parse_day_param,
+    slot_color,
+)
+from ui import ui as ui_handler
 
 
 # --- day_range ---------------------------------------------------------------
@@ -47,6 +59,21 @@ def test_parse_day_param_end_of_day():
     assert result == datetime(2026, 8, 12, 23, 59, 59, 999999, tzinfo=timezone.utc)
 
 
+def test_parse_day_param_clamps_date_below_minimum():
+    assert parse_day_param("0001-01-01", end_of_day=True) == MIN_DAY
+
+
+def test_parse_day_param_clamps_date_above_maximum():
+    assert parse_day_param("9999-12-31", end_of_day=False) == MAX_DAY
+
+
+def test_ui_survives_minimal_date():
+    # Регрессия: у 0001-01-01 минус окно по умолчанию нет представимого результата —
+    # datetime бросал OverflowError, и получалось 500 на ровном месте.
+    response = asyncio.run(ui_handler(skill="", since="", until="0001-01-01"))
+    assert response.status_code == 503  # база не подключена, но страница отрисовалась
+
+
 # --- embed_json ------------------------------------------------------------------
 
 def test_embed_json_round_trips_basic_data():
@@ -57,8 +84,16 @@ def test_embed_json_round_trips_basic_data():
 def test_embed_json_escapes_script_close_tag():
     # Имя скилла приходит по сети — если в нём окажется "</script>", тег не должен обрываться раньше времени.
     result = embed_json({"skill.name": "</script><script>alert(1)</script>"})
-    assert "</" not in result
-    assert "<\\/script>" in result
+    assert "<" not in result
+    assert json.loads(result) == {"skill.name": "</script><script>alert(1)</script>"}
+
+
+def test_embed_json_escapes_html_comment_opener():
+    # "<!--<script>" переводит разбор страницы в состояние, где настоящий </script>
+    # её уже не закрывает: экранировать только "</" мало.
+    result = embed_json({"skill.name": "<!--<script>"})
+    assert "<" not in result
+    assert json.loads(result) == {"skill.name": "<!--<script>"}
 
 
 def test_embed_json_keeps_non_ascii_readable():
@@ -68,6 +103,33 @@ def test_embed_json_keeps_non_ascii_readable():
 def test_embed_json_stringifies_non_serializable_values():
     result = embed_json({"when": date(2026, 1, 1)})
     assert "2026-01-01" in result
+
+
+# --- slot_color -------------------------------------------------------------------
+
+def test_slot_color_uses_palette_variables_for_first_slots():
+    assert slot_color(0) == {"color_var": "--series-1"}
+    assert slot_color(PALETTE_SLOTS - 1) == {"color_var": f"--series-{PALETTE_SLOTS}"}
+
+
+def test_slot_color_generates_color_beyond_palette():
+    # Регрессия: CSS-переменных всего PALETTE_SLOTS штук. Слот сверх палитры не должен
+    # ссылаться на несуществующую --series-N — cssVar() вернул бы пустую строку, и линия
+    # осталась бы без цвета.
+    beyond = slot_color(PALETTE_SLOTS)
+    assert "color_var" not in beyond
+    assert beyond["color"].startswith("hsl(")
+
+
+def test_slot_color_gives_every_featured_slot_a_color():
+    colors = [slot_color(i) for i in range(FEATURED_SLOTS)]
+    assert all(c.get("color") or c.get("color_var") for c in colors)
+
+
+def test_slot_color_keeps_neighbouring_slots_apart():
+    # Золотой угол: соседние по рейтингу линии не должны получать почти один оттенок.
+    hues = [float(slot_color(i)["color"].split("(")[1].split()[0]) for i in range(PALETTE_SLOTS, FEATURED_SLOTS)]
+    assert all(abs(a - b) > 20 for a, b in zip(hues, hues[1:]))
 
 
 # --- load_chart_data (с подставным соединением вместо Postgres) --------------------
