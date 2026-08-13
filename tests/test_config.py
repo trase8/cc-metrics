@@ -119,3 +119,9 @@ def test_insert_sql_placeholder_count_matches_column_count():
     columns = re.search(r"INSERT INTO skill_usage \(([^)]+)\)", config.INSERT_SQL, re.S).group(1)
     placeholders = re.search(r"VALUES \(([^)]+)\)", config.INSERT_SQL, re.S).group(1)
     assert len(columns.split(",")) == len(placeholders.split(","))
+
+
+def test_insert_columns_all_declared_in_ddl():
+    columns = re.search(r"INSERT INTO skill_usage \(([^)]+)\)", config.INSERT_SQL, re.S).group(1)
+    declared = set(re.findall(r"^ {4}(\w+)\s", config.DDL, re.M))
+    assert {c.strip() for c in columns.split(",")} <= declared

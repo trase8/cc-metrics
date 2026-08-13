@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 from typing import Any
 
@@ -24,16 +24,17 @@ DEFAULT_WINDOW_DAYS = 30
 MAX_CHART_DAYS = 400
 OTHER_LABEL = "Другое"
 
-GLOBAL_RANKING_SQL = "SELECT skill, count(*) AS n FROM skill_usage GROUP BY skill ORDER BY n DESC, skill ASC"
+GLOBAL_RANKING_SQL = (
+    "SELECT skill FROM skill_usage GROUP BY skill "
+    f"ORDER BY count(*) DESC, skill ASC LIMIT {FEATURED_SLOTS}"
+)
 
 
-def day_range(start: datetime, end: datetime) -> list[datetime]:
-    """Список полуночей UTC от start до end включительно — ось X графика."""
-    start_day = start.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_day = end.replace(hour=0, minute=0, second=0, microsecond=0)
+def day_range(start: datetime, end: datetime) -> list[date]:
+    """Список дней от start до end включительно — ось X графика."""
     days = []
-    d = start_day
-    while d <= end_day:
+    d, last = start.date(), end.date()
+    while d <= last:
         days.append(d)
         d += timedelta(days=1)
     return days
@@ -58,25 +59,29 @@ def embed_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str).replace("</", "<\\/")
 
 
-async def load_chart_data(conn, conditions: list[str], params: list[Any], since_day: datetime, until_day: datetime):
+async def load_chart_data(conn, skill: str, since_day: datetime, until_day: datetime):
     """Возвращает данные для Chart.js: ось X — дни, датасет на каждый из топ-N скиллов + "Другое"."""
-    ranking = await conn.fetch(GLOBAL_RANKING_SQL)
-    featured = [r["skill"] for r in ranking[:FEATURED_SLOTS]]
+    featured = [r["skill"] for r in await conn.fetch(GLOBAL_RANKING_SQL)]
     slot_of = {name: f"--series-{i + 1}" for i, name in enumerate(featured)}
 
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    sql = (
-        "SELECT date_trunc('day', occurred_at) AS bucket, skill, count(*)::int AS n "
-        f"FROM skill_usage {where} GROUP BY bucket, skill ORDER BY bucket"
+    # Границы окна — всегда, фильтр по скиллу — по желанию; отсюда и нумерация плейсхолдеров.
+    where = "received_at BETWEEN $1 AND $2"
+    params: list[Any] = [since_day, until_day]
+    if skill:
+        params.append(f"%{skill}%")
+        where += f" AND skill ILIKE ${len(params)}"
+    rows = await conn.fetch(
+        "SELECT date_trunc('day', received_at) AS bucket, skill, count(*)::int AS n "
+        f"FROM skill_usage WHERE {where} GROUP BY bucket, skill ORDER BY bucket",
+        *params,
     )
-    rows = await conn.fetch(sql, *params)
 
     days = day_range(since_day, until_day)
-    day_index = {d.date().isoformat(): i for i, d in enumerate(days)}
+    day_index = {d: i for i, d in enumerate(days)}
 
     series: dict[str, list[int]] = {}
     for r in rows:
-        idx = day_index.get(r["bucket"].date().isoformat())
+        idx = day_index.get(r["bucket"].date())
         if idx is None:
             continue  # вне диапазона дней — не должно происходить при согласованных условиях, но не рушим страницу
         label = r["skill"] if r["skill"] in slot_of else OTHER_LABEL
@@ -91,7 +96,7 @@ async def load_chart_data(conn, conditions: list[str], params: list[Any], since_
         for label in ordered_labels
     ]
 
-    return {"labels": [d.date().isoformat() for d in days], "datasets": datasets}
+    return {"labels": [d.isoformat() for d in days], "datasets": datasets}
 
 
 UI_PAGE_TEMPLATE = """<!doctype html>
@@ -149,7 +154,6 @@ UI_PAGE_TEMPLATE = """<!doctype html>
 <body class="viz-root">
 <h1>Вызовы скиллов Claude Code</h1>
 <form method="get" action="/ui">
-  <label>Пользователь<input type="text" name="user" value="{user}" placeholder="vasya@01.tech"></label>
   <label>Скилл<input type="text" name="skill" value="{skill}" placeholder="cr"></label>
   <label>С<input type="date" name="since" value="{since}"></label>
   <label>По<input type="date" name="until" value="{until}"></label>
@@ -328,7 +332,6 @@ def render_ui_page(
 """
 
     return UI_PAGE_TEMPLATE.format(
-        user=escape(filters["user"]),
         skill=escape(filters["skill"]),
         since=escape(filters["since"]),
         until=escape(filters["until"]),
@@ -338,27 +341,23 @@ def render_ui_page(
 
 @router.get("/ui", response_class=HTMLResponse, dependencies=[Depends(config.require_ui_auth)])
 async def ui(
-    user: str = Query(""),
     skill: str = Query(""),
     since: str = Query(""),
     until: str = Query(""),
 ) -> HTMLResponse:
-    now = datetime.now(timezone.utc)
-    until_dt = parse_day_param(until, end_of_day=True) or now
-    since_dt = parse_day_param(since, end_of_day=False)
-    if since_dt is None:
-        since_dt = until_dt - timedelta(days=DEFAULT_WINDOW_DAYS - 1)
-        since_display = since_dt.date().isoformat()
-    else:
-        since_display = since
+    until_dt = parse_day_param(until, end_of_day=True) or datetime.now(timezone.utc)
+    since_dt = (
+        parse_day_param(since, end_of_day=False)
+        or until_dt - timedelta(days=DEFAULT_WINDOW_DAYS - 1)
+    )
 
-    clamped = False
-    if (until_dt.date() - since_dt.date()).days > MAX_CHART_DAYS:
+    clamped = (until_dt.date() - since_dt.date()).days > MAX_CHART_DAYS
+    if clamped:
         since_dt = until_dt - timedelta(days=MAX_CHART_DAYS)
-        since_display = since_dt.date().isoformat()
-        clamped = True
 
-    filters = {"user": user, "skill": skill, "since": since_display, "until": until}
+    # since показываем уже нормализованным — иначе окно по умолчанию и обрезанный диапазон
+    # не видны в форме. until оставляем как пришёл: пустое поле означает «по сейчас».
+    filters = {"skill": skill, "since": since_dt.date().isoformat(), "until": until}
 
     if config.pool is None:
         return HTMLResponse(
@@ -367,22 +366,9 @@ async def ui(
             status_code=503,
         )
 
-    conditions = []
-    params: list[Any] = []
-    if user:
-        params.append(f"%{user}%")
-        conditions.append(f"user_email ILIKE ${len(params)}")
-    if skill:
-        params.append(f"%{skill}%")
-        conditions.append(f"skill ILIKE ${len(params)}")
-    params.append(since_dt)
-    conditions.append(f"occurred_at >= ${len(params)}")
-    params.append(until_dt)
-    conditions.append(f"occurred_at <= ${len(params)}")
-
     try:
         async with config.pool.acquire() as conn:
-            chart = await load_chart_data(conn, conditions, params, since_dt, until_dt)
+            chart = await load_chart_data(conn, skill, since_dt, until_dt)
     except Exception:
         log.exception("не смог прочитать skill_usage для /ui")
         return HTMLResponse(render_ui_page(error="Не смог прочитать данные из базы.", filters=filters),

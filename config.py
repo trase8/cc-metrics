@@ -12,12 +12,14 @@ import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-# Без asctime: в строке уже печатается время самого события, а время приёма
-# добавит рантайм (docker logs -t, journald и т.п.).
+# Время в строке — это время приёма, единственное, которое мы вообще знаем: время события
+# на машине разработчика больше не разбирается и не хранится. Печатает его сам логгер,
+# в поясе TZ (asctime идёт через localtime), а не код обработчика.
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
-    format="%(levelname)-5s %(message)s",
+    format="%(asctime)s %(levelname)-5s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("cc-metrics")
 
@@ -63,9 +65,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DDL = """
 CREATE TABLE IF NOT EXISTS skill_usage (
     id              bigserial PRIMARY KEY,
-    occurred_at     timestamptz NOT NULL,
     received_at     timestamptz NOT NULL DEFAULT now(),
-    user_email      text        NOT NULL,
     skill           text        NOT NULL,
     trigger         text,
     source          text,
@@ -74,21 +74,21 @@ CREATE TABLE IF NOT EXISTS skill_usage (
     skill_kind      text,
     session_id      text,
     event_sequence  bigint,
-    department      text,
-    team_id         text,
     terminal_type   text,
-    raw             jsonb,
     UNIQUE (session_id, event_sequence)
 );
-CREATE INDEX IF NOT EXISTS skill_usage_occurred_at_idx ON skill_usage (occurred_at DESC);
-CREATE INDEX IF NOT EXISTS skill_usage_user_skill_idx  ON skill_usage (user_email, skill);
+CREATE INDEX IF NOT EXISTS skill_usage_received_at_idx ON skill_usage (received_at DESC);
+CREATE INDEX IF NOT EXISTS skill_usage_skill_idx       ON skill_usage (skill);
 """
 
+# received_at в списке колонок нет намеренно: его проставляет DEFAULT now() на стороне
+# Postgres. Это единственное время, которое мы храним, и оно заведомо настоящее —
+# часы клиента на него не влияют.
 INSERT_SQL = """
 INSERT INTO skill_usage (
-    occurred_at, user_email, skill, trigger, source, plugin, marketplace,
-    skill_kind, session_id, event_sequence, department, team_id, terminal_type, raw
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+    skill, trigger, source, plugin, marketplace,
+    skill_kind, session_id, event_sequence, terminal_type
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (session_id, event_sequence) DO NOTHING
 """
 

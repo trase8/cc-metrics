@@ -2,15 +2,17 @@
 
 import asyncio
 import gzip
-from datetime import datetime, timedelta, timezone
+import re
+
+import config
 
 from api import (
     decode_any_value,
     decode_attributes,
     describe_skill,
+    drop_identity,
     gunzip_capped,
     handle_record,
-    parse_occurred_at,
     read_body_capped,
 )
 
@@ -68,37 +70,6 @@ def test_decode_attributes_handles_none_input():
     assert decode_attributes(None) == {}
 
 
-# --- parse_occurred_at -------------------------------------------------------
-
-def test_parse_occurred_at_uses_time_unix_nano():
-    record = {"timeUnixNano": "1700000000000000000"}
-    assert parse_occurred_at(record, {}) == datetime.fromtimestamp(1700000000, tz=timezone.utc)
-
-
-def test_parse_occurred_at_falls_back_to_observed_when_time_unix_nano_broken():
-    record = {"timeUnixNano": "not-a-number", "observedTimeUnixNano": "1700000000000000000"}
-    assert parse_occurred_at(record, {}) == datetime.fromtimestamp(1700000000, tz=timezone.utc)
-
-
-def test_parse_occurred_at_assumes_utc_for_naive_iso_attr():
-    attrs = {"event.timestamp": "2026-01-01T12:00:00"}
-    assert parse_occurred_at({}, attrs) == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-
-def test_parse_occurred_at_preserves_explicit_timezone_from_iso_attr():
-    attrs = {"event.timestamp": "2026-01-01T12:00:00+03:00"}
-    result = parse_occurred_at({}, attrs)
-    assert result.utcoffset() == timedelta(hours=3)
-    assert result.hour == 12
-
-
-def test_parse_occurred_at_falls_back_to_now_when_nothing_usable():
-    before = datetime.now(timezone.utc)
-    result = parse_occurred_at({}, {})
-    after = datetime.now(timezone.utc)
-    assert before <= result <= after
-
-
 # --- describe_skill -----------------------------------------------------------
 
 def test_describe_skill_includes_present_fields_only():
@@ -124,22 +95,21 @@ def test_handle_record_ignores_non_skill_events():
 def test_handle_record_missing_skill_name_falls_back_to_placeholder():
     record = {"attributes": [{"key": "event.name", "value": {"stringValue": "skill_activated"}}]}
     row = handle_record(record, {})
-    assert row[2] == "?"
+    assert row[0] == "?"
 
 
 def test_handle_record_record_attrs_win_over_resource_attrs_on_conflict():
-    resource_attrs = {"department": "rnd", "user.email": "resource@example.com"}
+    resource_attrs = {"terminal.type": "resource-terminal", "session.id": "sess-1"}
     record = {
-        "timeUnixNano": "1700000000000000000",
         "attributes": [
             {"key": "event.name", "value": {"stringValue": "skill_activated"}},
-            {"key": "user.email", "value": {"stringValue": "record@example.com"}},
+            {"key": "terminal.type", "value": {"stringValue": "record-terminal"}},
             {"key": "skill.name", "value": {"stringValue": "01-dev-pipeline:cr"}},
         ],
     }
     row = handle_record(record, resource_attrs)
-    assert row[1] == "record@example.com"  # запись переопределяет ресурс при совпадении ключа
-    assert row[10] == "rnd"  # ключ, которого не было в записи, приходит из resource_attrs
+    assert row[8] == "record-terminal"  # запись переопределяет ресурс при совпадении ключа
+    assert row[6] == "sess-1"  # ключ, которого не было в записи, приходит из resource_attrs
 
 
 def test_handle_record_ignores_non_int_sequence():
@@ -152,7 +122,55 @@ def test_handle_record_ignores_non_int_sequence():
         ],
     }
     row = handle_record(record, {})
-    assert row[9] is None
+    assert row[7] is None
+
+
+def test_handle_record_keeps_identity_out_of_the_row():
+    # Личность приходит и в ресурсных атрибутах, и в самой записи — ни то, ни другое
+    # не должно оказаться ни в одном поле строки: метрики анонимные.
+    resource_attrs = {"user.account_uuid": "uuid-from-resource"}
+    record = {
+        "attributes": [
+            {"key": "event.name", "value": {"stringValue": "skill_activated"}},
+            {"key": "skill.name", "value": {"stringValue": "01-dev-pipeline:cr"}},
+            {"key": "user.email", "value": {"stringValue": "vasya@01.tech"}},
+        ],
+    }
+    row = handle_record(record, resource_attrs)
+    assert "vasya@01.tech" not in str(row)
+    assert "uuid-from-resource" not in str(row)
+    assert row[0] == "01-dev-pipeline:cr"  # неперсональные поля на месте
+
+
+def test_handle_record_row_length_matches_insert_sql():
+    # Строка из api.py подставляется в INSERT_SQL из config.py — при правке колонок
+    # эти два места разъезжаются молча, до первой записи в реальную базу.
+    record = {"attributes": [{"key": "event.name", "value": {"stringValue": "skill_activated"}}]}
+    placeholders = re.search(r"VALUES \(([^)]+)\)", config.INSERT_SQL, re.S).group(1)
+    assert len(handle_record(record, {})) == len(placeholders.split(","))
+
+
+# --- drop_identity ---------------------------------------------------------------
+
+def test_drop_identity_removes_known_user_attributes():
+    attrs = {
+        "user.email": "vasya@01.tech",
+        "user.account_uuid": "uuid",
+        "user.id": "id",
+        "skill.name": "cr",
+    }
+    assert drop_identity(attrs) == {"skill.name": "cr"}
+
+
+def test_drop_identity_removes_unknown_user_attributes_too():
+    # Отбор по префиксу, а не по списку ключей: новый user.*-атрибут в Claude Code
+    # не должен просочиться в лог и в базу.
+    assert drop_identity({"user.display_name": "Вася"}) == {}
+
+
+def test_drop_identity_keeps_attributes_with_similar_names():
+    attrs = {"userland": "x", "terminal.type": "iTerm.app", "organization.id": "org"}
+    assert drop_identity(attrs) == attrs
 
 
 # --- gunzip_capped -------------------------------------------------------------

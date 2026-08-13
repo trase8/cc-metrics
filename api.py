@@ -6,7 +6,6 @@ import gzip
 import io
 import json
 import zlib
-from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
@@ -70,6 +69,16 @@ def decode_any_value(value: dict[str, Any]) -> Any:
     return None
 
 
+def drop_identity(attrs: dict[str, Any]) -> dict[str, Any]:
+    """Выбрасывает атрибуты личности (`user.email`, `user.account_uuid`, `user.id`).
+
+    Метрики анонимные: кто именно запустил скилл — не собираем и не храним. Отбираем по
+    префиксу, а не по списку ключей: Claude Code может добавить новые `user.*`-атрибуты,
+    и они не должны просочиться ни в лог, ни в базу.
+    """
+    return {key: value for key, value in attrs.items() if not key.startswith("user.")}
+
+
 def decode_attributes(attributes: list[dict[str, Any]] | None) -> dict[str, Any]:
     """Превращает список OTLP-атрибутов в плоский словарь."""
     result: dict[str, Any] = {}
@@ -78,28 +87,6 @@ def decode_attributes(attributes: list[dict[str, Any]] | None) -> dict[str, Any]
         if isinstance(key, str):
             result[key] = decode_any_value(attr.get("value") or {})
     return result
-
-
-def parse_occurred_at(record: dict[str, Any], attrs: dict[str, Any]) -> datetime:
-    """Время самого события (не приёма): наносекунды из записи, затем ISO-атрибут, затем «сейчас».
-
-    Всегда с таймзоной — колонка в базе timestamptz, наивный datetime туда класть нельзя.
-    """
-    for field in ("timeUnixNano", "observedTimeUnixNano"):
-        raw = record.get(field)
-        if isinstance(raw, (str, int)):
-            try:
-                return datetime.fromtimestamp(int(raw) / 1_000_000_000, tz=timezone.utc)
-            except (TypeError, ValueError, OSError):
-                pass
-    iso = attrs.get("event.timestamp")
-    if isinstance(iso, str):
-        try:
-            parsed = datetime.fromisoformat(iso)
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-        except ValueError:
-            pass
-    return datetime.now(timezone.utc)
 
 
 def describe_skill(attrs: dict[str, Any]) -> str:
@@ -121,23 +108,20 @@ def describe_skill(attrs: dict[str, Any]) -> str:
 
 def handle_record(record: dict[str, Any], resource_attrs: dict[str, Any]) -> tuple | None:
     """Печатает запись в лог и возвращает строку для вставки, если это вызов скилла."""
-    attrs = {**resource_attrs, **decode_attributes(record.get("attributes"))}
+    # drop_identity — единственный барьер: дальше по коду личности в attrs уже нет,
+    # поэтому она не попадёт ни в лог, ни в строку для вставки.
+    attrs = drop_identity({**resource_attrs, **decode_attributes(record.get("attributes"))})
     event = attrs.get("event.name") or "?"
-    who = attrs.get("user.email") or attrs.get("user.account_uuid") or attrs.get("user.id") or "?"
-    occurred_at = parse_occurred_at(record, attrs)
-    when = occurred_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
     if event != "skill_activated":
         if config.LOG_ALL_EVENTS:
-            log.info("event  %s  %s  %s", when, who, event)
+            log.info("event  %s", event)
         return None
 
-    log.info("SKILL  %s  %s  %s", when, who, describe_skill(attrs))
+    log.info("SKILL  %s", describe_skill(attrs))
 
     sequence = attrs.get("event.sequence")
     return (
-        occurred_at,
-        str(who),
         str(attrs.get("skill.name") or "?"),
         attrs.get("invocation_trigger"),
         attrs.get("skill.source"),
@@ -146,10 +130,7 @@ def handle_record(record: dict[str, Any], resource_attrs: dict[str, Any]) -> tup
         attrs.get("skill.kind"),
         attrs.get("session.id"),
         sequence if isinstance(sequence, int) else None,
-        attrs.get("department"),
-        attrs.get("team.id"),
         attrs.get("terminal.type"),
-        json.dumps(attrs, ensure_ascii=False, default=str),
     )
 
 
